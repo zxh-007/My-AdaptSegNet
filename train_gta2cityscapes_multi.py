@@ -13,20 +13,26 @@ import sys
 import os
 import os.path as osp
 import random
+import time
+import datetime
+from tqdm import tqdm
 from tensorboardX import SummaryWriter
 
 from model.deeplab_multi import DeeplabMulti
 from model.discriminator import FCDiscriminator
 from utils.loss import CrossEntropy2d
 from dataset.gta5_dataset import GTA5DataSet
-from dataset.cityscapes_dataset import cityscapesDataSet
+from dataset.cityscapes_dataset import cityscapesDataSet, CityscapesDataSetWithLabel
+
+from compute_iou import fast_hist, per_class_iu
 
 ############### for debug #######################
-# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 ###############################################
 
 IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
 
+EXPERIMENT_NAME = 'GTA2Cityscapes_multi'
 MODEL = 'DeepLab'
 BATCH_SIZE = 1
 ITER_SIZE = 1
@@ -48,7 +54,7 @@ RANDOM_SEED = 1234
 RESTORE_FROM = 'http://vllab.ucmerced.edu/ytsai/CVPR18/DeepLab_resnet_pretrained_init-f81d91e8.pth'
 SAVE_NUM_IMAGES = 2
 SAVE_PRED_EVERY = 5000
-SNAPSHOT_DIR = './snapshots/GTA2Cityscapes_multi'
+SNAPSHOT_DIR = './snapshots/' + EXPERIMENT_NAME
 WEIGHT_DECAY = 0.0005
 LOG_DIR = './log'
 
@@ -145,6 +151,9 @@ def get_arguments():
 
 
 args = get_arguments()
+time_stamp = time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())
+args.log_dir = os.path.join(args.log_dir, EXPERIMENT_NAME + '_' + time_stamp)
+args.snapshot_dir = args.snapshot_dir + '_' + time_stamp
 
 
 def lr_poly(base_lr, iter, max_iter, power):
@@ -214,23 +223,31 @@ def main():
     if not os.path.exists(args.snapshot_dir):
         os.makedirs(args.snapshot_dir)
 
-    trainloader = data.DataLoader(
+    train_loader = data.DataLoader(
         GTA5DataSet(args.data_dir, args.data_list, max_iters=args.num_steps * args.iter_size * args.batch_size,
                     crop_size=input_size,
                     scale=args.random_scale, mirror=args.random_mirror, mean=IMG_MEAN),
         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-    trainloader_iter = enumerate(trainloader)
+    train_loader_iter = enumerate(train_loader)
 
-    targetloader = data.DataLoader(cityscapesDataSet(args.data_dir_target, args.data_list_target,
-                                                     max_iters=args.num_steps * args.iter_size * args.batch_size,
-                                                     crop_size=input_size_target,
-                                                     scale=False, mirror=args.random_mirror, mean=IMG_MEAN,
-                                                     set=args.set),
-                                   batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                                   pin_memory=True)
+    target_loader = data.DataLoader(cityscapesDataSet(args.data_dir_target, args.data_list_target,
+                                                      max_iters=args.num_steps * args.iter_size * args.batch_size,
+                                                      crop_size=input_size_target,
+                                                      scale=False, mirror=args.random_mirror, mean=IMG_MEAN,
+                                                      set=args.set),
+                                    batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+                                    pin_memory=True)
 
-    targetloader_iter = enumerate(targetloader)
+    target_loader_iter = enumerate(target_loader)
+
+    target_val_loader = data.DataLoader(
+        CityscapesDataSetWithLabel(args.data_dir_target, './dataset/cityscapes_list/val.txt',
+                                   crop_size=None,
+                                   scale=False, mirror=False, mean=IMG_MEAN,
+                                   set='val'),
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+        pin_memory=True)
 
     # implement model.optim_parameters(args) to handle different models' lr setting
 
@@ -257,12 +274,17 @@ def main():
     source_label = 0
     target_label = 1
 
+    best_miou = 0
+
     # set up tensor board
     if args.tensorboard:
         if not os.path.exists(args.log_dir):
             os.makedirs(args.log_dir)
 
         writer = SummaryWriter(args.log_dir)
+
+    start_time = time.time()
+    print('Start Training, total {} iterations'.format(args.num_steps))
 
     for i_iter in range(args.num_steps):
 
@@ -295,7 +317,7 @@ def main():
 
             # train with source
 
-            _, batch = trainloader_iter.__next__()
+            _, batch = train_loader_iter.__next__()
 
             images, labels, _, _ = batch
             images = images.to(device)
@@ -317,7 +339,7 @@ def main():
 
             # train with target
 
-            _, batch = targetloader_iter.__next__()
+            _, batch = target_loader_iter.__next__()
             images, _, _ = batch
             images = images.to(device)
 
@@ -391,6 +413,9 @@ def main():
         optimizer_D1.step()
         optimizer_D2.step()
 
+        eta_seconds = ((time.time() - start_time) / (i_iter + 1)) * (args.num_steps_stop - i_iter)
+        eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+
         if args.tensorboard:
             scalar_info = {
                 'loss_seg1': loss_seg_value1,
@@ -407,9 +432,9 @@ def main():
 
         print('exp = {}'.format(args.snapshot_dir))
         print(
-            'iter = {0:8d}/{1:8d}, loss_seg1 = {2:.3f} loss_seg2 = {3:.3f} loss_adv1 = {4:.3f}, loss_adv2 = {5:.3f} loss_D1 = {6:.3f} loss_D2 = {7:.3f}'.format(
+            'iter = {0:8d}/{1:8d}, loss_seg1 = {2:.3f} loss_seg2 = {3:.3f} loss_adv1 = {4:.3f}, loss_adv2 = {5:.3f} loss_D1 = {6:.3f} loss_D2 = {7:.3f} || Estimated Time: {8}'.format(
                 i_iter, args.num_steps, loss_seg_value1, loss_seg_value2, loss_adv_target_value1,
-                loss_adv_target_value2, loss_D_value1, loss_D_value2))
+                loss_adv_target_value2, loss_D_value1, loss_D_value2, eta_string))
 
         if i_iter >= args.num_steps_stop - 1:
             print('save model ...')
@@ -426,8 +451,48 @@ def main():
             torch.save(model_D1.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(i_iter) + '_D1.pth'))
             torch.save(model_D2.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(i_iter) + '_D2.pth'))
 
+            iou19, miou = evaluate(model, target_val_loader, device)
+            writer.add_scalar('target_mIoU', float(miou), i_iter)
+
+            if miou > best_miou:
+                print('{} iteration is the best, taking best snapshot ...'.format(i_iter))
+                torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + 'best' + '.pth'))
+                torch.save(model_D1.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + 'best' + '_D1.pth'))
+                torch.save(model_D2.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + 'best' + '_D2.pth'))
+
+            outputfile = open(osp.join(args.snapshot_dir, 'score.txt'), 'a')
+            outputfile.write(str(i_iter) + '\t' + str(miou) + '\t' + str(iou19.replace('\n', ' ')) + '\n')
+            outputfile.close()
+
     if args.tensorboard:
         writer.close()
+
+
+def evaluate(model, data_loader, device):
+    model.eval()
+    torch.cuda.empty_cache()
+
+    interp = nn.Upsample(size=(1024, 2048), mode='bilinear', align_corners=True)
+    hist = np.zeros((args.num_classes, args.num_classes))
+    with torch.no_grad():
+        for batch in tqdm(data_loader):
+            img, label, _, name = batch
+            img = img.to(device)
+            label = np.array(label).astype(np.uint8)
+
+            output1, output2 = model(img)
+            output = interp(output2).cpu().data[0].numpy()
+            pred = np.asarray(np.argmax(output, axis=0), dtype=np.uint8)
+
+            hist += fast_hist(label.flatten(), pred.flatten(), args.num_classes)
+
+        mIoUs = per_class_iu(hist)
+        for ind_class in range(args.num_classes):
+            print('===>' + data_loader.dataset.name_classes[ind_class] + ':\t' + str(round(mIoUs[ind_class] * 100, 2)))
+        print('===> mIoU: ' + str(round(np.nanmean(mIoUs) * 100, 2)))
+
+        model.train()
+        return str(mIoUs), round(np.nanmean(mIoUs) * 100, 2)
 
 
 if __name__ == '__main__':
