@@ -245,7 +245,7 @@ def main():
     target_loader_iter = enumerate(target_loader)
 
     target_val_loader = data.DataLoader(
-        ZurichDataSet(args.data_dir_target, './dataset/zurich_list/val.txt',
+        ZurichDataSetWithLabel(args.data_dir_target, './dataset/zurich_list/val.txt',
                       crop_size=None,
                       scale=False, mirror=False, mean=IMG_MEAN,
                       set='val'),
@@ -448,7 +448,7 @@ def main():
                        osp.join(args.snapshot_dir, 'GTA5_' + str(args.num_steps_stop) + '_D2.pth'))
             break
 
-        if i_iter % args.save_pred_every == 0 and i_iter != 0:
+        if i_iter % args.save_pred_every == 0:
             print('taking snapshot ...')
             torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(i_iter) + '.pth'))
             torch.save(model_D1.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(i_iter) + '_D1.pth'))
@@ -475,7 +475,7 @@ def evaluate(model, data_loader, device):
     model.eval()
     torch.cuda.empty_cache()
 
-    interp = nn.Upsample(size=(1024, 2048), mode='bilinear', align_corners=True)
+    interp = nn.Upsample(size=(1080, 1920), mode='bilinear', align_corners=True)
     hist = np.zeros((args.num_classes, args.num_classes))
     with torch.no_grad():
         for batch in tqdm(data_loader):
