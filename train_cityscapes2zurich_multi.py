@@ -21,7 +21,7 @@ from tensorboardX import SummaryWriter
 from model.deeplab_multi import DeeplabMulti
 from model.discriminator import FCDiscriminator
 from utils.loss import CrossEntropy2d
-from dataset.gta5_dataset import GTA5DataSet
+from dataset.zurich_dataset import ZurichDataSetWithLabel,ZurichDataSet
 from dataset.cityscapes_dataset import cityscapesDataSet, CityscapesDataSetWithLabel
 
 from compute_iou import fast_hist, per_class_iu
@@ -32,18 +32,18 @@ from compute_iou import fast_hist, per_class_iu
 
 IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
 
-EXPERIMENT_NAME = 'GTA2Cityscapes_multi'
+EXPERIMENT_NAME = 'Cityscapes2Zurich_multi'
 MODEL = 'DeepLab'
 BATCH_SIZE = 1
 ITER_SIZE = 1
 NUM_WORKERS = 4
-DATA_DIRECTORY = '/data3/chenlin/data/GTA5'
-DATA_LIST_PATH = './dataset/gta5_list/train.txt'
+DATA_DIRECTORY = '/data3/chenlin/data/cityscapes'
+DATA_LIST_PATH = './dataset/cityscapes_list/train.txt'
 IGNORE_LABEL = 255
-INPUT_SIZE = '1280,720'
-DATA_DIRECTORY_TARGET = '/data3/chenlin/data/cityscapes'
-DATA_LIST_PATH_TARGET = './dataset/cityscapes_list/train.txt'
-INPUT_SIZE_TARGET = '1024,512'
+INPUT_SIZE = '1024,512'
+DATA_DIRECTORY_TARGET = '/data3/chenlin/data/Foggy_Zurich'
+DATA_LIST_PATH_TARGET = './dataset/zurich_list/train.txt'
+INPUT_SIZE_TARGET = '1280,720'
 LEARNING_RATE = 2.5e-4
 MOMENTUM = 0.9
 NUM_CLASSES = 19
@@ -64,7 +64,7 @@ LAMBDA_ADV_TARGET1 = 0.0002
 LAMBDA_ADV_TARGET2 = 0.001
 GAN = 'Vanilla'
 
-TARGET = 'cityscapes'
+TARGET = 'zurich'
 SET = 'train'
 
 
@@ -224,14 +224,17 @@ def main():
         os.makedirs(args.snapshot_dir)
 
     train_loader = data.DataLoader(
-        GTA5DataSet(args.data_dir, args.data_list, max_iters=args.num_steps * args.iter_size * args.batch_size,
-                    crop_size=input_size,
-                    scale=args.random_scale, mirror=args.random_mirror, mean=IMG_MEAN),
-        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+        CityscapesDataSetWithLabel(args.data_dir, args.data_list,
+                          max_iters=args.num_steps * args.iter_size * args.batch_size,
+                          crop_size=input_size,
+                          scale=False, mirror=args.random_mirror, mean=IMG_MEAN,
+                          set=args.set),
+        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        pin_memory=True)
 
     train_loader_iter = enumerate(train_loader)
 
-    target_loader = data.DataLoader(cityscapesDataSet(args.data_dir_target, args.data_list_target,
+    target_loader = data.DataLoader(ZurichDataSet(args.data_dir_target, args.data_list_target,
                                                       max_iters=args.num_steps * args.iter_size * args.batch_size,
                                                       crop_size=input_size_target,
                                                       scale=False, mirror=args.random_mirror, mean=IMG_MEAN,
@@ -242,10 +245,10 @@ def main():
     target_loader_iter = enumerate(target_loader)
 
     target_val_loader = data.DataLoader(
-        CityscapesDataSetWithLabel(args.data_dir_target, './dataset/cityscapes_list/val.txt',
-                                   crop_size=None,
-                                   scale=False, mirror=False, mean=IMG_MEAN,
-                                   set='val'),
+        ZurichDataSet(args.data_dir_target, './dataset/zurich_list/val.txt',
+                      crop_size=None,
+                      scale=False, mirror=False, mean=IMG_MEAN,
+                      set='val'),
         batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
         pin_memory=True)
 
