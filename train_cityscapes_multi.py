@@ -1,0 +1,341 @@
+import argparse
+import torch
+import torch.nn as nn
+from torch.utils import data, model_zoo
+import numpy as np
+import pickle
+from torch.autograd import Variable
+import torch.optim as optim
+import scipy.misc
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+import sys
+import os
+import os.path as osp
+import random
+import time
+import datetime
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+
+from model.deeplab_multi import DeeplabMulti
+from model.discriminator import FCDiscriminator
+from utils.loss import CrossEntropy2d
+from dataset.zurich_dataset import ZurichDataSetWithLabel,ZurichDataSet
+from dataset.cityscapes_dataset import cityscapesDataSet, CityscapesDataSetWithLabel
+
+from compute_iou import fast_hist, per_class_iu
+
+############### for debug #######################
+# os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+###############################################
+
+IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
+
+EXPERIMENT_NAME = 'Cityscapes_multi'
+MODEL = 'DeepLab'
+BATCH_SIZE = 1
+ITER_SIZE = 1
+NUM_WORKERS = 4
+DATA_DIRECTORY = '/data3/chenlin/data/cityscapes'
+DATA_LIST_PATH = './dataset/cityscapes_list/train.txt'
+IGNORE_LABEL = 255
+INPUT_SIZE = '1024,512'
+LEARNING_RATE = 2.5e-4
+MOMENTUM = 0.9
+NUM_CLASSES = 19
+NUM_STEPS = 250000
+NUM_STEPS_STOP = 150000  # early stopping, set according to the loss trend of your task
+POWER = 0.9
+RANDOM_SEED = 1234
+RESTORE_FROM = 'http://vllab.ucmerced.edu/ytsai/CVPR18/DeepLab_resnet_pretrained_init-f81d91e8.pth'
+SAVE_NUM_IMAGES = 2
+SAVE_PRED_EVERY = 5000
+SNAPSHOT_DIR = './snapshots/' + EXPERIMENT_NAME
+WEIGHT_DECAY = 0.0005
+LOG_DIR = './log'
+
+LEARNING_RATE_D = 1e-4
+LAMBDA_SEG = 0.1
+LAMBDA_ADV_TARGET1 = 0.0002
+LAMBDA_ADV_TARGET2 = 0.001
+
+SET = 'train'
+
+
+def get_arguments():
+    """Parse all the arguments provided from the CLI.
+
+    Returns:
+      A list of parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="DeepLab-ResNet Network")
+    parser.add_argument("--model", type=str, default=MODEL,
+                        help="available options : DeepLab")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help="Number of images sent to the network in one step.")
+    parser.add_argument("--iter-size", type=int, default=ITER_SIZE,
+                        help="Accumulate gradients for ITER_SIZE iterations.")
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS,
+                        help="number of workers for multithread dataloading.")
+    parser.add_argument("--data-dir", type=str, default=DATA_DIRECTORY,
+                        help="Path to the directory containing the source dataset.")
+    parser.add_argument("--data-list", type=str, default=DATA_LIST_PATH,
+                        help="Path to the file listing the images in the source dataset.")
+    parser.add_argument("--ignore-label", type=int, default=IGNORE_LABEL,
+                        help="The index of the label to ignore during the training.")
+    parser.add_argument("--input-size", type=str, default=INPUT_SIZE,
+                        help="Comma-separated string with height and width of source images.")
+    parser.add_argument("--is-training", action="store_true",
+                        help="Whether to updates the running means and variances during the training.")
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE,
+                        help="Base learning rate for training with polynomial decay.")
+    parser.add_argument("--learning-rate-D", type=float, default=LEARNING_RATE_D,
+                        help="Base learning rate for discriminator.")
+    parser.add_argument("--lambda-seg", type=float, default=LAMBDA_SEG,
+                        help="lambda_seg.")
+    parser.add_argument("--lambda-adv-target1", type=float, default=LAMBDA_ADV_TARGET1,
+                        help="lambda_adv for adversarial training.")
+    parser.add_argument("--lambda-adv-target2", type=float, default=LAMBDA_ADV_TARGET2,
+                        help="lambda_adv for adversarial training.")
+    parser.add_argument("--momentum", type=float, default=MOMENTUM,
+                        help="Momentum component of the optimiser.")
+    parser.add_argument("--not-restore-last", action="store_true",
+                        help="Whether to not restore last (FC) layers.")
+    parser.add_argument("--num-classes", type=int, default=NUM_CLASSES,
+                        help="Number of classes to predict (including background).")
+    parser.add_argument("--num-steps", type=int, default=NUM_STEPS,
+                        help="Number of training steps.")
+    parser.add_argument("--num-steps-stop", type=int, default=NUM_STEPS_STOP,
+                        help="Number of training steps for early stopping.")
+    parser.add_argument("--power", type=float, default=POWER,
+                        help="Decay parameter to compute the learning rate.")
+    parser.add_argument("--random-mirror", action="store_true",
+                        help="Whether to randomly mirror the inputs during the training.")
+    parser.add_argument("--random-scale", action="store_true",
+                        help="Whether to randomly scale the inputs during the training.")
+    parser.add_argument("--random-seed", type=int, default=RANDOM_SEED,
+                        help="Random seed to have reproducible results.")
+    parser.add_argument("--restore-from", type=str, default=RESTORE_FROM,
+                        help="Where restore model parameters from.")
+    parser.add_argument("--save-num-images", type=int, default=SAVE_NUM_IMAGES,
+                        help="How many images to save.")
+    parser.add_argument("--save-pred-every", type=int, default=SAVE_PRED_EVERY,
+                        help="Save summaries and checkpoint every often.")
+    parser.add_argument("--snapshot-dir", type=str, default=SNAPSHOT_DIR,
+                        help="Where to save snapshots of the model.")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
+                        help="Regularisation parameter for L2-loss.")
+    parser.add_argument("--cpu", action='store_true', help="choose to use cpu device.")
+    parser.add_argument("--tensorboard", default=True, help="choose whether to use tensorboard.")
+    parser.add_argument("--log-dir", type=str, default=LOG_DIR,
+                        help="Path to the directory of log.")
+    parser.add_argument("--set", type=str, default=SET,
+                        help="choose adaptation set.")
+    return parser.parse_args()
+
+
+args = get_arguments()
+time_stamp = time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())
+args.log_dir = os.path.join(args.log_dir, EXPERIMENT_NAME + '_' + time_stamp)
+args.snapshot_dir = args.snapshot_dir + '_' + time_stamp
+
+
+def lr_poly(base_lr, iter, max_iter, power):
+    return base_lr * ((1 - float(iter) / max_iter) ** (power))
+
+
+def adjust_learning_rate(optimizer, i_iter):
+    lr = lr_poly(args.learning_rate, i_iter, args.num_steps, args.power)
+    optimizer.param_groups[0]['lr'] = lr
+    if len(optimizer.param_groups) > 1:
+        optimizer.param_groups[1]['lr'] = lr * 10
+
+
+def adjust_learning_rate_D(optimizer, i_iter):
+    lr = lr_poly(args.learning_rate_D, i_iter, args.num_steps, args.power)
+    optimizer.param_groups[0]['lr'] = lr
+    if len(optimizer.param_groups) > 1:
+        optimizer.param_groups[1]['lr'] = lr * 10
+
+
+def main():
+    """Create the model and start the training."""
+
+    device = torch.device("cuda" if not args.cpu else "cpu")
+
+    w, h = map(int, args.input_size.split(','))
+    input_size = (w, h)
+
+    cudnn.enabled = True
+
+    # Create network
+    if args.model == 'DeepLab':
+        model = DeeplabMulti(num_classes=args.num_classes)
+        if args.restore_from[:4] == 'http':
+            saved_state_dict = model_zoo.load_url(args.restore_from)
+        else:
+            saved_state_dict = torch.load(args.restore_from)
+
+        new_params = model.state_dict().copy()
+        for i in saved_state_dict:
+            # Scale.layer5.conv2d_list.3.weight
+            i_parts = i.split('.')
+            # print i_parts
+            if not args.num_classes == 19 or not i_parts[1] == 'layer5':
+                new_params['.'.join(i_parts[1:])] = saved_state_dict[i]
+                # print i_parts
+        model.load_state_dict(new_params)
+
+    model.train()
+    model.to(device)
+
+    cudnn.benchmark = True
+
+    if not os.path.exists(args.snapshot_dir):
+        os.makedirs(args.snapshot_dir)
+
+    train_loader = data.DataLoader(
+        CityscapesDataSetWithLabel(args.data_dir, args.data_list,
+                          max_iters=args.num_steps * args.iter_size * args.batch_size,
+                          crop_size=input_size,
+                          scale=False, mirror=args.random_mirror, mean=IMG_MEAN,
+                          set=args.set),
+        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        pin_memory=True)
+
+    train_loader_iter = enumerate(train_loader)
+
+    val_loader = data.DataLoader(
+        CityscapesDataSetWithLabel(args.data_dir, './dataset/cityscapes_list/val.txt',
+                                   crop_size=None,
+                                   scale=False, mirror=False, mean=IMG_MEAN,
+                                   set='val'),
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+        pin_memory=True)
+
+    # implement model.optim_parameters(args) to handle different models' lr setting
+
+    optimizer = optim.SGD(model.optim_parameters(args),
+                          lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer.zero_grad()
+
+    interp = nn.Upsample(size=(input_size[1], input_size[0]), mode='bilinear', align_corners=True)
+    seg_loss = torch.nn.CrossEntropyLoss(ignore_index=255)
+
+    best_miou = 0
+
+    # set up tensor board
+    if args.tensorboard:
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir)
+
+        writer = SummaryWriter(args.log_dir)
+
+    start_time = time.time()
+    print('Start Training, total {} iterations'.format(args.num_steps))
+
+    for i_iter in range(args.num_steps):
+
+        loss_seg_value1 = 0
+
+        loss_seg_value2 = 0
+
+        optimizer.zero_grad()
+        adjust_learning_rate(optimizer, i_iter)
+
+        for sub_i in range(args.iter_size):
+
+            _, batch = train_loader_iter.__next__()
+
+            images, labels, _, _ = batch
+            images = images.to(device)
+            labels = labels.long().to(device)
+
+            pred1, pred2 = model(images)
+            pred1 = interp(pred1)
+            pred2 = interp(pred2)
+
+            loss_seg1 = seg_loss(pred1, labels)
+            loss_seg2 = seg_loss(pred2, labels)
+            loss = loss_seg2 + args.lambda_seg * loss_seg1
+
+            # proper normalization
+            loss = loss / args.iter_size
+            loss.backward()
+            loss_seg_value1 += loss_seg1.item() / args.iter_size
+            loss_seg_value2 += loss_seg2.item() / args.iter_size
+
+        optimizer.step()
+
+        eta_seconds = ((time.time() - start_time) / (i_iter + 1)) * (args.num_steps_stop - i_iter)
+        eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+        if args.tensorboard:
+            scalar_info = {
+                'loss_seg1': loss_seg_value1,
+                'loss_seg2': loss_seg_value2,
+            }
+
+            if i_iter % 10 == 0:
+                for key, val in scalar_info.items():
+                    writer.add_scalar(key, val, i_iter)
+
+        print('exp = {}'.format(args.snapshot_dir))
+        print(
+            'iter = {0:8d}/{1:8d}, loss_seg1 = {2:.3f} loss_seg2 = {3:.3f} || Estimated Time: {4}'.format(
+                i_iter, args.num_steps, loss_seg_value1, loss_seg_value2, eta_string))
+
+        if i_iter >= args.num_steps_stop - 1:
+            print('save model ...')
+            torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(args.num_steps_stop) + '.pth'))
+            break
+
+        if i_iter % args.save_pred_every == 0 and i_iter != 0:
+            print('taking snapshot ...')
+            torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + str(i_iter) + '.pth'))
+
+            iou19, miou = evaluate(model, val_loader, device)
+            writer.add_scalar('target_mIoU', float(miou), i_iter)
+
+            if miou > best_miou:
+                print('{} iteration is the best, taking best snapshot ...'.format(i_iter))
+                torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'GTA5_' + 'best' + '.pth'))
+
+            outputfile = open(osp.join(args.snapshot_dir, 'score.txt'), 'a')
+            outputfile.write(str(i_iter) + '\t' + str(miou) + '\t' + str(iou19.replace('\n', ' ')) + '\n')
+            outputfile.close()
+
+    if args.tensorboard:
+        writer.close()
+
+
+def evaluate(model, data_loader, device):
+    model.eval()
+    torch.cuda.empty_cache()
+
+    interp = nn.Upsample(size=(1024, 2048), mode='bilinear', align_corners=True)
+    hist = np.zeros((args.num_classes, args.num_classes))
+    with torch.no_grad():
+        for batch in tqdm(data_loader):
+            img, label, _, name = batch
+            img = img.to(device)
+            label = np.array(label).astype(np.uint8)
+
+            output1, output2 = model(img)
+            output = interp(output2).cpu().data[0].numpy()
+            pred = np.asarray(np.argmax(output, axis=0), dtype=np.uint8)
+
+            hist += fast_hist(label.flatten(), pred.flatten(), args.num_classes)
+
+        mIoUs = per_class_iu(hist)
+        for ind_class in range(args.num_classes):
+            print('===>' + data_loader.dataset.name_classes[ind_class] + ':\t' + str(round(mIoUs[ind_class] * 100, 2)))
+        print('===> mIoU: ' + str(round(np.nanmean(mIoUs) * 100, 2)))
+
+        model.train()
+        return str(mIoUs), round(np.nanmean(mIoUs) * 100, 2)
+
+
+if __name__ == '__main__':
+    main()
